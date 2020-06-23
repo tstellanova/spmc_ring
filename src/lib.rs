@@ -36,11 +36,13 @@ impl Default for ReadToken {
     }
 }
 
-impl<T, N: ArrayLength<T>> SpmcQueue<T, N>
-where
-    T: core::default::Default + Copy,
+impl<T, N> Default for SpmcQueue<T, N>
+    where
+        T: core::default::Default + Copy,
+        N: generic_array::ArrayLength<T>
 {
-    pub fn new() -> Self {
+    fn default() -> Self {
+        Self::new_with_generation(0);
         let mut inst = Self {
             buf: GenericArray::default(),
             buf_len: 0,
@@ -52,17 +54,26 @@ where
         //println!("buf_len: {}", inst.buf_len);
         inst
     }
+}
 
-    pub fn default() -> Self {
+
+impl<T, N> SpmcQueue<T, N>
+where
+    T: core::default::Default + Copy,
+    N: generic_array::ArrayLength<T>
+{
+    fn new_with_generation(gen: usize) -> Self {
         let mut inst = Self {
             buf: GenericArray::default(),
             buf_len: 0,
             read_idx: AtomicUsize::new(0),
-            write_idx: AtomicUsize::new(0),
+            write_idx: AtomicUsize::new(gen),
             mut_lock: AtomicBool::new(false),
         };
         inst.buf_len = inst.buf.len();
-        //println!("buf_len: {}", inst.buf_len);
+        if gen > inst.buf_len {
+            inst.read_idx.store(inst.write_idx.load(Ordering::SeqCst) - inst.buf_len, Ordering::SeqCst);
+        }
         inst
     }
 
@@ -172,7 +183,7 @@ mod tests {
     #[test]
     fn alternating_write_read() {
         const WRITE_COUNT: u32 = 5;
-        let mut q = SpmcQueue::<Simpleton, U10>::new();
+        let mut q = SpmcQueue::<Simpleton, U10>::default();
         let mut read_token = ReadToken::default();
 
         for i in 0..WRITE_COUNT {
@@ -195,7 +206,7 @@ mod tests {
     #[test]
     fn sequential_write_read() {
         const WRITE_COUNT: u32 = 5;
-        let mut q = SpmcQueue::<Simpleton, U10>::new();
+        let mut q = SpmcQueue::<Simpleton, U10>::default();
         let mut read_token = ReadToken::default();
 
         for i in 0..WRITE_COUNT {
@@ -220,10 +231,10 @@ mod tests {
     }
 
     #[test]
-    fn wrapping_rw() {
+    fn buffer_overflow_write_read() {
         const BUF_SIZE: u32 = 10;
         const ITEM_COUNT: u32 = BUF_SIZE * 2;
-        let mut q = SpmcQueue::<Simpleton, U10>::new();
+        let mut q = SpmcQueue::<Simpleton, U10>::default();
 
         //publish more items than the buffer has space to hold
         for i in 0..ITEM_COUNT {
@@ -253,5 +264,39 @@ mod tests {
 
         let one_more = q.read_next(&mut read_token);
         assert!(one_more.is_err());
+    }
+
+    #[test]
+    fn generation_overflow_write_read() {
+        const BUF_SIZE: u32 = 10;
+        const ITEM_COUNT: u32 = 5 * BUF_SIZE;
+        const FIRST_GENERATION: usize = usize::MAX - 20;
+
+        // we initialize a queue with many generations already supposedly published:
+        // this allows us to test generation overflow in a reasonable time
+        let mut q: SpmcQueue::<Simpleton, U10> = SpmcQueue::new_with_generation(FIRST_GENERATION);
+
+        // now publish many more items, so that generation counter (write index) overflows
+        for i in 0..ITEM_COUNT {
+            let s = Simpleton {
+                x: i,
+                y: i,
+                temperature: i as f32,
+            };
+            q.publish(&s);
+        }
+        assert_eq!(q.available() as u32, BUF_SIZE);
+        // then publish a few more generations
+        for i in 0..5 {
+            let clamped_val: u32 = (i % u32::MAX as usize) as u32;
+            let s = Simpleton {
+                x: clamped_val,
+                y: clamped_val,
+                temperature: clamped_val as f32,
+            };
+            q.publish(&s);
+        }
+        assert_eq!(q.available() as u32, BUF_SIZE);
+
     }
 }
