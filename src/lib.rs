@@ -1,0 +1,257 @@
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use generic_array::{ArrayLength, GenericArray};
+
+pub struct SpmcQueue<T, N: ArrayLength<T>> {
+    /// The inner item buffer
+    buf: GenericArray<T, N>,
+
+    /// cached mask for inner buffer length
+    buf_len: usize,
+
+    /// The oldest available item in the queue.
+    /// This grows unbounded until it wraps, and is only masked into
+    /// the inner buffer range when we access the array.
+    read_idx: AtomicUsize,
+
+    /// The index at which the next item should be written to the buffer
+    /// This grows unbounded until it wraps, and is only masked into
+    /// the inner buffer range when we access the array.
+    write_idx: AtomicUsize,
+
+    /// A mutability lock
+    mut_lock: AtomicBool,
+}
+
+pub struct ReadToken {
+    idx: usize,
+    initialized: bool,
+}
+
+impl Default for ReadToken {
+    fn default() -> Self {
+        Self {
+            idx: 0,
+            initialized: false,
+        }
+    }
+}
+
+impl<T, N: ArrayLength<T>> SpmcQueue<T, N>
+where
+    T: core::default::Default + Copy,
+{
+    pub fn new() -> Self {
+        let mut inst = Self {
+            buf: GenericArray::default(),
+            buf_len: 0,
+            read_idx: AtomicUsize::new(0),
+            write_idx: AtomicUsize::new(0),
+            mut_lock: AtomicBool::new(false),
+        };
+        inst.buf_len = inst.buf.len();
+        //println!("buf_len: {}", inst.buf_len);
+        inst
+    }
+
+    pub fn default() -> Self {
+        let mut inst = Self {
+            buf: GenericArray::default(),
+            buf_len: 0,
+            read_idx: AtomicUsize::new(0),
+            write_idx: AtomicUsize::new(0),
+            mut_lock: AtomicBool::new(false),
+        };
+        inst.buf_len = inst.buf.len();
+        //println!("buf_len: {}", inst.buf_len);
+        inst
+    }
+
+    /// Publish a single item
+    pub fn publish(&mut self, val: &T) {
+        self.lock_me();
+        //effectively this reserves space for the write
+        let widx = self.write_idx.fetch_add(1, Ordering::SeqCst);
+        let clamped_widx = widx % self.buf_len;
+        // println!("widx {} cwidx: {} ", widx, clamped_widx);
+        //copy value into buffer
+        self.buf[clamped_widx] = *val;
+        let ridx = self.read_idx.load(Ordering::SeqCst);
+        // after the buffer is filled, the oldest item should always trail behind
+        // the write index by the buffer size
+        let used = (widx + 1).wrapping_sub(ridx);
+        if used > self.buf_len {
+            let new_ridx = (widx + 1).wrapping_sub(self.buf_len);
+            // println!("trailing ridx {}", new_ridx);
+            self.read_idx.store(new_ridx, Ordering::SeqCst)
+        }
+        //thanks to wrapping behavior, oldest value is
+        //automatically removed when we push to a full buffer
+        self.unlock_me();
+    }
+
+    /// Read an item from the queue
+    /// Returns either an available msg or WouldBlock
+    pub fn read_next(&mut self, token: &mut ReadToken) -> nb::Result<T, ()> {
+        let widx = self.write_idx.load(Ordering::SeqCst);
+        let oldest_idx = self.read_idx.load(Ordering::SeqCst);
+        let total_avail = widx.wrapping_sub(oldest_idx);
+        //println!("oldest: {} widx: {} avail: {}", oldest_idx, widx, total_avail);
+
+        if 0 == total_avail {
+            //note that this should never happen after the first push to the internal buffer
+            return Err(nb::Error::WouldBlock);
+        }
+
+        let ridx = if token.initialized {
+            // TODO adjust comparison math for wrapping
+
+            if token.idx < oldest_idx {
+                oldest_idx
+            } else if (token.idx + 1) >= widx {
+                return Err(nb::Error::WouldBlock);
+            } else {
+                token.idx + 1
+            }
+        } else {
+            // println!("token uninit: use oldest as ridx");
+            oldest_idx
+        };
+        token.initialized = true;
+        token.idx = ridx;
+        let clamped_ridx = ridx % self.buf_len;
+        //println!("clamped_ridx: {}", clamped_ridx);
+
+        let val = self.buf[clamped_ridx];
+        Ok(val)
+    }
+
+    /// Is the queue empty?
+    pub fn empty(&self) -> bool {
+        self.write_idx.load(Ordering::SeqCst) == self.read_idx.load(Ordering::SeqCst)
+    }
+
+    pub fn available(&self) -> usize {
+        self.write_idx
+            .load(Ordering::SeqCst)
+            .wrapping_sub(self.read_idx.load(Ordering::SeqCst))
+    }
+
+    pub fn item_at(&self, n: usize) -> T {
+        self.buf[n]
+    }
+
+    fn lock_me(&mut self) {
+        while self
+            .mut_lock
+            .compare_and_swap(false, true, Ordering::Acquire)
+            != false
+        {
+            while self.mut_lock.load(Ordering::Relaxed) {
+                core::sync::atomic::spin_loop_hint();
+            }
+        }
+    }
+
+    fn unlock_me(&mut self) {
+        self.mut_lock
+            .compare_and_swap(true, false, Ordering::Acquire);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use generic_array::typenum::U10;
+    #[derive(Default, Debug, Copy, Clone)]
+    struct Simpleton {
+        x: u32,
+        y: u32,
+        temperature: f32,
+    }
+
+    #[test]
+    fn alternating_write_read() {
+        const WRITE_COUNT: u32 = 5;
+        let mut q = SpmcQueue::<Simpleton, U10>::new();
+        let mut read_token = ReadToken::default();
+
+        for i in 0..WRITE_COUNT {
+            let s = Simpleton {
+                x: i,
+                y: i,
+                temperature: i as f32,
+            };
+            q.publish(&s);
+            assert_eq!(q.available(), (i + 1) as usize);
+            let cur_msg = q.read_next(&mut read_token).unwrap();
+            // println!("i: {} cur_msg: {:?} read_idx: {}",i, cur_msg, read_token.idx );
+            assert_eq!(i, cur_msg.x);
+        }
+
+        let one_more = q.read_next(&mut read_token);
+        assert!(one_more.is_err());
+    }
+
+    #[test]
+    fn sequential_write_read() {
+        const WRITE_COUNT: u32 = 5;
+        let mut q = SpmcQueue::<Simpleton, U10>::new();
+        let mut read_token = ReadToken::default();
+
+        for i in 0..WRITE_COUNT {
+            let s = Simpleton {
+                x: i,
+                y: i,
+                temperature: i as f32,
+            };
+            q.publish(&s);
+            // println!("item {}: in {:?} out {:?}", i, s, q.item_at(i as usize));
+        }
+        assert_eq!(q.available() as u32, WRITE_COUNT);
+
+        for i in 0..WRITE_COUNT {
+            let cur_msg = q.read_next(&mut read_token).unwrap();
+            // println!("i: {} cur_msg: {:?} read_idx: {}",i, cur_msg, read_token.idx );
+            assert_eq!(i, cur_msg.x);
+        }
+
+        let one_more = q.read_next(&mut read_token);
+        assert!(one_more.is_err());
+    }
+
+    #[test]
+    fn wrapping_rw() {
+        const BUF_SIZE: u32 = 10;
+        const ITEM_COUNT: u32 = BUF_SIZE * 2;
+        let mut q = SpmcQueue::<Simpleton, U10>::new();
+
+        //publish more items than the buffer has space to hold
+        for i in 0..ITEM_COUNT {
+            let s = Simpleton {
+                x: i,
+                y: i,
+                temperature: i as f32,
+            };
+            q.publish(&s);
+        }
+        assert_eq!(q.available() as u32, BUF_SIZE);
+
+        let mut read_token = ReadToken::default();
+        let mut pre_val = 9;
+
+        for _ in 0..BUF_SIZE {
+            let cur_msg = q.read_next(&mut read_token).unwrap();
+            // println!(
+            //     "next {}: cur_msg: {:?} pre_val: {}  read_idx: {}",i,
+            //     cur_msg, pre_val, read_token.idx
+            // );
+            //verify values ascending
+            let cur_val = cur_msg.x;
+            assert_eq!(cur_val.wrapping_sub(pre_val), 1);
+            pre_val = cur_val;
+        }
+
+        let one_more = q.read_next(&mut read_token);
+        assert!(one_more.is_err());
+    }
+}
