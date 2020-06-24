@@ -2,8 +2,16 @@
 name = "spmc_ring"
 version = "0.1.0"
 authors = ["Todd Stellanova <tstellanova@users.noreply.github.com>"]
+description= "Thread-safe no_std ring buffer"
+license = "BSD-3-Clause"
 edition = "2018"
-
+repository = "https://github.com/tstellanova/spmc_ring"
+categories = ["embedded", "no-std", "memory-management"]
+keywords = [
+    "buffer",
+    "pubsub"
+]
+readme = "README.md"
 
 [dependencies]
 generic-array = "0.14.2"

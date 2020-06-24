@@ -1,6 +1,19 @@
+/*
+Copyright (c) 2020 Todd Stellanova
+LICENSE: BSD3 (see LICENSE file)
+*/
+
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use generic_array::{ArrayLength, GenericArray};
 
+/// This is a ring-buffer queue that is intended to be
+/// used for pub-sub applications.  That is, a single
+/// producer writes items to the circular queue, and
+/// multiple consumers can read items from the queue.
+/// When a write to the fixed-size circular buffer overflows,
+/// the oldest items in the queue are overwritten.
+/// It is up to the readers to keep track of which items they
+/// have already read and poll for the next available item.
 pub struct SpmcQueue<T, N: ArrayLength<T>> {
     /// The inner item buffer
     buf: GenericArray<T, N>,
@@ -9,7 +22,7 @@ pub struct SpmcQueue<T, N: ArrayLength<T>> {
     buf_len: usize,
 
     /// The oldest available item in the queue.
-    /// This grows unbounded until it wraps, and is only masked into
+    /// This index grows unbounded until it wraps, and is only masked into
     /// the inner buffer range when we access the array.
     read_idx: AtomicUsize,
 
@@ -17,6 +30,9 @@ pub struct SpmcQueue<T, N: ArrayLength<T>> {
     /// This grows unbounded until it wraps, and is only masked into
     /// the inner buffer range when we access the array.
     write_idx: AtomicUsize,
+
+    /// Have at least buf_len items been written to the queue?
+    filled: AtomicBool,
 
     /// A mutability lock
     mut_lock: AtomicBool,
@@ -37,42 +53,38 @@ impl Default for ReadToken {
 }
 
 impl<T, N> Default for SpmcQueue<T, N>
-    where
-        T: core::default::Default + Copy,
-        N: generic_array::ArrayLength<T>
+where
+    T: core::default::Default + Copy,
+    N: generic_array::ArrayLength<T>,
 {
     fn default() -> Self {
-        Self::new_with_generation(0);
-        let mut inst = Self {
-            buf: GenericArray::default(),
-            buf_len: 0,
-            read_idx: AtomicUsize::new(0),
-            write_idx: AtomicUsize::new(0),
-            mut_lock: AtomicBool::new(false),
-        };
-        inst.buf_len = inst.buf.len();
-        //println!("buf_len: {}", inst.buf_len);
-        inst
+        Self::new_with_generation(0)
     }
 }
-
 
 impl<T, N> SpmcQueue<T, N>
 where
     T: core::default::Default + Copy,
-    N: generic_array::ArrayLength<T>
+    N: generic_array::ArrayLength<T>,
 {
+    /// Create a queue prepopulated with some
+    /// number of default-value items.
     fn new_with_generation(gen: usize) -> Self {
         let mut inst = Self {
             buf: GenericArray::default(),
             buf_len: 0,
             read_idx: AtomicUsize::new(0),
             write_idx: AtomicUsize::new(gen),
+            filled: AtomicBool::new(false),
             mut_lock: AtomicBool::new(false),
         };
         inst.buf_len = inst.buf.len();
         if gen > inst.buf_len {
-            inst.read_idx.store(inst.write_idx.load(Ordering::SeqCst) - inst.buf_len, Ordering::SeqCst);
+            inst.filled.store(true, Ordering::SeqCst);
+            inst.read_idx.store(
+                inst.write_idx.load(Ordering::SeqCst) - inst.buf_len,
+                Ordering::SeqCst,
+            );
         }
         inst
     }
@@ -86,15 +98,19 @@ where
         // println!("widx {} cwidx: {} ", widx, clamped_widx);
         //copy value into buffer
         self.buf[clamped_widx] = *val;
-        let ridx = self.read_idx.load(Ordering::SeqCst);
-        // after the buffer is filled, the oldest item should always trail behind
-        // the write index by the buffer size
-        let used = (widx + 1).wrapping_sub(ridx);
-        if used > self.buf_len {
-            let new_ridx = (widx + 1).wrapping_sub(self.buf_len);
-            // println!("trailing ridx {}", new_ridx);
-            self.read_idx.store(new_ridx, Ordering::SeqCst)
+
+        // once the queue is full, read_idx should always trail write_idx by a fixed amount
+        if self.filled.load(Ordering::SeqCst) {
+            let new_ridx = self
+                .write_idx
+                .load(Ordering::SeqCst)
+                .wrapping_sub(self.buf_len);
+            //println!("trailing ridx {}", new_ridx);
+            self.read_idx.store(new_ridx, Ordering::SeqCst);
+        } else if clamped_widx == (self.buf_len - 1) {
+            self.filled.store(true, Ordering::SeqCst);
         }
+
         //thanks to wrapping behavior, oldest value is
         //automatically removed when we push to a full buffer
         self.unlock_me();
@@ -173,25 +189,26 @@ where
 mod tests {
     use super::*;
     use generic_array::typenum::U10;
+
     #[derive(Default, Debug, Copy, Clone)]
-    struct Simpleton {
+    struct Simple {
         x: u32,
         y: u32,
-        temperature: f32,
+    }
+    impl Simple {
+        fn new(x: u32, y: u32) -> Self {
+            Self { x, y }
+        }
     }
 
     #[test]
     fn alternating_write_read() {
         const WRITE_COUNT: u32 = 5;
-        let mut q = SpmcQueue::<Simpleton, U10>::default();
+        let mut q = SpmcQueue::<Simple, U10>::default();
         let mut read_token = ReadToken::default();
 
         for i in 0..WRITE_COUNT {
-            let s = Simpleton {
-                x: i,
-                y: i,
-                temperature: i as f32,
-            };
+            let s = Simple::new(i, i);
             q.publish(&s);
             assert_eq!(q.available(), (i + 1) as usize);
             let cur_msg = q.read_next(&mut read_token).unwrap();
@@ -206,15 +223,11 @@ mod tests {
     #[test]
     fn sequential_write_read() {
         const WRITE_COUNT: u32 = 5;
-        let mut q = SpmcQueue::<Simpleton, U10>::default();
+        let mut q = SpmcQueue::<Simple, U10>::default();
         let mut read_token = ReadToken::default();
 
         for i in 0..WRITE_COUNT {
-            let s = Simpleton {
-                x: i,
-                y: i,
-                temperature: i as f32,
-            };
+            let s = Simple::new(i, i);
             q.publish(&s);
             // println!("item {}: in {:?} out {:?}", i, s, q.item_at(i as usize));
         }
@@ -234,15 +247,11 @@ mod tests {
     fn buffer_overflow_write_read() {
         const BUF_SIZE: u32 = 10;
         const ITEM_COUNT: u32 = BUF_SIZE * 2;
-        let mut q = SpmcQueue::<Simpleton, U10>::default();
+        let mut q = SpmcQueue::<Simple, U10>::default();
 
         //publish more items than the buffer has space to hold
         for i in 0..ITEM_COUNT {
-            let s = Simpleton {
-                x: i,
-                y: i,
-                temperature: i as f32,
-            };
+            let s = Simple::new(i, i);
             q.publish(&s);
         }
         assert_eq!(q.available() as u32, BUF_SIZE);
@@ -269,34 +278,24 @@ mod tests {
     #[test]
     fn generation_overflow_write_read() {
         const BUF_SIZE: u32 = 10;
-        const ITEM_COUNT: u32 = 5 * BUF_SIZE;
+        const ITEM_PUBLISH_COUNT: u32 = 5 * BUF_SIZE;
         const FIRST_GENERATION: usize = usize::MAX - 20;
 
         // we initialize a queue with many generations already supposedly published:
         // this allows us to test generation overflow in a reasonable time
-        let mut q: SpmcQueue::<Simpleton, U10> = SpmcQueue::new_with_generation(FIRST_GENERATION);
+        let mut q: SpmcQueue<Simple, U10> = SpmcQueue::new_with_generation(FIRST_GENERATION);
 
         // now publish many more items, so that generation counter (write index) overflows
-        for i in 0..ITEM_COUNT {
-            let s = Simpleton {
-                x: i,
-                y: i,
-                temperature: i as f32,
-            };
+        for i in 0..ITEM_PUBLISH_COUNT {
+            let s = Simple::new(i, i);
             q.publish(&s);
         }
         assert_eq!(q.available() as u32, BUF_SIZE);
         // then publish a few more generations
         for i in 0..5 {
-            let clamped_val: u32 = (i % u32::MAX as usize) as u32;
-            let s = Simpleton {
-                x: clamped_val,
-                y: clamped_val,
-                temperature: clamped_val as f32,
-            };
+            let s = Simple::new(i, i);
             q.publish(&s);
         }
         assert_eq!(q.available() as u32, BUF_SIZE);
-
     }
 }
