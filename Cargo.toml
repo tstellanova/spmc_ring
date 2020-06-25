@@ -1,6 +1,6 @@
 [package]
 name = "spms_ring"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Todd Stellanova <tstellanova@users.noreply.github.com>"]
 description= "Single publisher, multiple subscriber ring buffer for pubsub"
 license = "BSD-3-Clause"
