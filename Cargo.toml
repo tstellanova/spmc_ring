@@ -1,8 +1,8 @@
 [package]
-name = "spmc_ring"
-version = "0.1.0"
+name = "spms_ring"
+version = "0.1.1"
 authors = ["Todd Stellanova <tstellanova@users.noreply.github.com>"]
-description= "Thread-safe no_std ring buffer"
+description= "Single publisher, multiple subscriber ring buffer for pubsub"
 license = "BSD-3-Clause"
 edition = "2018"
 repository = "https://github.com/tstellanova/spms_ring"
