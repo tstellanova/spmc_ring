@@ -160,18 +160,17 @@ where
     fn read_before_full(&self, token: &mut ReadToken) -> nb::Result<T, ()> {
         //oldest_idx should be zero if we aren't full yet
         let oldest_idx = 0; //self.read_idx.load(Ordering::SeqCst);
+        let widx = self.write_idx.load(Ordering::SeqCst);
 
         let ridx = if !token.initialized {
             oldest_idx
         } else {
             let desired = token.idx.wrapping_add(1);
-            let widx = self.write_idx.load(Ordering::SeqCst);
-            if desired >= widx {
-                //asking for an item that is not yet available
-                return Err(nb::Error::WouldBlock);
-            }
             desired
         };
+        if ridx >= widx {
+            return Err(nb::Error::WouldBlock);
+        }
         token.initialized = true;
         token.idx = ridx;
 
@@ -234,7 +233,7 @@ mod tests {
         let mut read_token = ReadToken::default();
 
         //at first there is no data available
-        let read_res = q.read_next(&mut read_token);
+        let mut read_res = q.read_next(&mut read_token);
         //should be no data available yet
         assert!(read_res.is_err());
         assert_eq!( read_res.err().unwrap(), nb::Error::WouldBlock);
@@ -243,9 +242,10 @@ mod tests {
             let s = Simple::new(i, i);
             q.publish(&s);
             assert_eq!(q.available(), (i + 1) as usize);
-            //force the read_token to ask for something that doesn't exist
-            read_token.idx = (i+1) as usize ;
-            let read_res = q.read_next(&mut read_token);
+            //read something that should exist
+            read_res = q.read_next(&mut read_token);
+            assert!(read_res.is_ok());
+            read_res = q.read_next(&mut read_token);
             assert_eq!( read_res.err().unwrap(), nb::Error::WouldBlock);
         }
     }
