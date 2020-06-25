@@ -1,6 +1,6 @@
-# spmc_ring
+# spms_ring
 
-Intended as a single-producer, multiple consumer queue for no_std rust. 
+Intended for use as single-publisher, multiple subscriber buffer for no_std rust. 
 
 ## License
 
@@ -8,4 +8,6 @@ BSD-3-Clause:  See LICENSE file.
 
 ## Status
 
-WIP, briefly tested (see library tests) 
+- [x] Briefly tested (see library tests) 
+- [ ] Example 
+- [ ] CI
