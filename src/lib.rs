@@ -228,6 +228,29 @@ mod tests {
     }
 
     #[test]
+    fn verify_nonblocking() {
+        const WRITE_COUNT: u32 = 5;
+        let mut q = SpmsRing::<Simple, U10>::default();
+        let mut read_token = ReadToken::default();
+
+        //at first there is no data available
+        let read_res = q.read_next(&mut read_token);
+        //should be no data available yet
+        assert!(read_res.is_err());
+        assert_eq!( read_res.err().unwrap(), nb::Error::WouldBlock);
+
+        for i in 0..WRITE_COUNT {
+            let s = Simple::new(i, i);
+            q.publish(&s);
+            assert_eq!(q.available(), (i + 1) as usize);
+            //force the read_token to ask for something that doesn't exist
+            read_token.idx = (i+1) as usize ;
+            let read_res = q.read_next(&mut read_token);
+            assert_eq!( read_res.err().unwrap(), nb::Error::WouldBlock);
+        }
+    }
+
+    #[test]
     fn alternating_write_read() {
         const WRITE_COUNT: u32 = 5;
         let mut q = SpmsRing::<Simple, U10>::default();
