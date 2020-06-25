@@ -5,6 +5,7 @@ LICENSE: BSD3 (see LICENSE file)
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use generic_array::{ArrayLength, GenericArray};
+use std::sync::atomic::Ordering::Relaxed;
 
 /// This is a ring-buffer queue that is intended to be
 /// used for pub-sub applications.  That is, a single
@@ -91,7 +92,6 @@ where
 
     /// Publish a single item
     pub fn publish(&mut self, val: &T) {
-        self.lock_me();
         //effectively this reserves space for the write
         let widx = self.write_idx.fetch_add(1, Ordering::SeqCst);
         let clamped_widx = widx % self.buf_len;
@@ -113,43 +113,85 @@ where
 
         //thanks to wrapping behavior, oldest value is
         //automatically removed when we push to a full buffer
-        self.unlock_me();
+    }
+
+    /// Used to serve reads when the buffer is already full
+    /// In practice there are only three results:
+    /// - Read from the token index + 1
+    /// - Read from oldest index
+    /// - nb::Error::WouldBlock
+    fn read_after_full(&mut self, token: &mut ReadToken) -> nb::Result<T, ()> {
+        let desired = token.idx.wrapping_add(1);
+        let widx = self.write_idx.load(Ordering::SeqCst);
+        if desired == widx {
+            // widx always leads the available items by one,
+            // so the caller is asking for an item that is not yet available
+            return Err(nb::Error::WouldBlock);
+        }
+
+        let oldest_idx = self.read_idx.load(Ordering::SeqCst);
+        let ridx = if token.initialized {
+            if widx > desired {
+                if desired >= oldest_idx {
+                    //the most frequent case (until wrapping)
+                    desired
+                } else {
+                    // we assume that the read token is stale and refresh it
+                    oldest_idx
+                }
+            } else {
+                // widx less than desired is only valid if we've wrapped
+                let gap = widx.wrapping_sub(desired);
+                if gap >= self.buf_len {
+                    // assume that the caller hasn't read in a long time
+                    println!("wrapped, assume stale");
+                    oldest_idx
+                } else {
+                    println!("wrapped");
+                    desired.wrapping_add(1)
+                }
+            }
+        } else {
+            oldest_idx
+        };
+
+        token.initialized = true;
+        token.idx = ridx;
+        let val = self.buf[ridx % self.buf_len];
+        Ok(val)
+    }
+
+    /// this assumes that the indices haven't wrapped yet
+    fn read_before_full(&mut self, token: &mut ReadToken) -> nb::Result<T, ()> {
+        //oldest_idx should be zero if we aren't full yet
+        let oldest_idx = 0; //self.read_idx.load(Ordering::SeqCst);
+
+        let ridx = if !token.initialized {
+            oldest_idx
+        } else {
+            let desired = token.idx.wrapping_add(1);
+            let widx = self.write_idx.load(Ordering::SeqCst);
+            if desired >= widx {
+                //asking for an item that is not yet available
+                return Err(nb::Error::WouldBlock);
+            }
+            desired
+        };
+        token.initialized = true;
+        token.idx = ridx;
+
+        let val = self.buf[ridx % self.buf_len];
+        Ok(val)
     }
 
     /// Read an item from the queue
     /// Returns either an available msg or WouldBlock
     pub fn read_next(&mut self, token: &mut ReadToken) -> nb::Result<T, ()> {
-        let widx = self.write_idx.load(Ordering::SeqCst);
-        let oldest_idx = self.read_idx.load(Ordering::SeqCst);
-        let total_avail = widx.wrapping_sub(oldest_idx);
-        //println!("oldest: {} widx: {} avail: {}", oldest_idx, widx, total_avail);
-
-        if 0 == total_avail {
-            //note that this should never happen after the first push to the internal buffer
-            return Err(nb::Error::WouldBlock);
-        }
-
-        let ridx = if token.initialized {
-            // TODO adjust comparison math for wrapping
-
-            if token.idx < oldest_idx {
-                oldest_idx
-            } else if (token.idx + 1) >= widx {
-                return Err(nb::Error::WouldBlock);
-            } else {
-                token.idx + 1
-            }
+        if self.filled.load(Ordering::SeqCst) {
+            self.read_after_full(token)
         } else {
-            // println!("token uninit: use oldest as ridx");
-            oldest_idx
-        };
-        token.initialized = true;
-        token.idx = ridx;
-        let clamped_ridx = ridx % self.buf_len;
-        //println!("clamped_ridx: {}", clamped_ridx);
-
-        let val = self.buf[clamped_ridx];
-        Ok(val)
+            self.read_before_full(token)
+        }
     }
 
     /// Is the queue empty?
@@ -157,15 +199,20 @@ where
         self.write_idx.load(Ordering::SeqCst) == self.read_idx.load(Ordering::SeqCst)
     }
 
+    /// How many total items are available to read?
     pub fn available(&self) -> usize {
-        self.write_idx
-            .load(Ordering::SeqCst)
-            .wrapping_sub(self.read_idx.load(Ordering::SeqCst))
+        if !self.filled.load(Relaxed) {
+            self.write_idx
+                .load(Ordering::SeqCst)
+                .wrapping_sub(self.read_idx.load(Ordering::SeqCst))
+        } else {
+            self.buf_len
+        }
     }
 
-    pub fn item_at(&self, n: usize) -> T {
-        self.buf[n]
-    }
+    // pub fn item_at(&self, n: usize) -> T {
+    //     self.buf[n]
+    // }
 
     fn lock_me(&mut self) {
         while self
@@ -245,6 +292,7 @@ mod tests {
 
     #[test]
     fn buffer_overflow_write_read() {
+        // Write many more items than the buffer can hold
         const BUF_SIZE: u32 = 10;
         const ITEM_COUNT: u32 = BUF_SIZE * 2;
         let mut q = SpmcQueue::<Simple, U10>::default();
@@ -257,17 +305,13 @@ mod tests {
         assert_eq!(q.available() as u32, BUF_SIZE);
 
         let mut read_token = ReadToken::default();
-        let mut pre_val = 9;
+        let mut pre_val = BUF_SIZE - 1;
 
         for _ in 0..BUF_SIZE {
             let cur_msg = q.read_next(&mut read_token).unwrap();
-            // println!(
-            //     "next {}: cur_msg: {:?} pre_val: {}  read_idx: {}",i,
-            //     cur_msg, pre_val, read_token.idx
-            // );
             //verify values ascending
             let cur_val = cur_msg.x;
-            assert_eq!(cur_val.wrapping_sub(pre_val), 1);
+            assert_eq!(cur_val - pre_val, 1);
             pre_val = cur_val;
         }
 
