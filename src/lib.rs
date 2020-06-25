@@ -5,7 +5,6 @@ LICENSE: BSD3 (see LICENSE file)
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use generic_array::{ArrayLength, GenericArray};
-use std::sync::atomic::Ordering::Relaxed;
 
 /// This is a ring-buffer queue that is intended to be
 /// used for pub-sub applications.  That is, a single
@@ -15,7 +14,7 @@ use std::sync::atomic::Ordering::Relaxed;
 /// the oldest items in the queue are overwritten.
 /// It is up to the readers to keep track of which items they
 /// have already read and poll for the next available item.
-pub struct SpmcQueue<T, N: ArrayLength<T>> {
+pub struct SpmsRing<T, N: ArrayLength<T>> {
     /// The inner item buffer
     buf: GenericArray<T, N>,
 
@@ -34,9 +33,6 @@ pub struct SpmcQueue<T, N: ArrayLength<T>> {
 
     /// Have at least buf_len items been written to the queue?
     filled: AtomicBool,
-
-    /// A mutability lock
-    mut_lock: AtomicBool,
 }
 
 pub struct ReadToken {
@@ -53,7 +49,7 @@ impl Default for ReadToken {
     }
 }
 
-impl<T, N> Default for SpmcQueue<T, N>
+impl<T, N> Default for SpmsRing<T, N>
 where
     T: core::default::Default + Copy,
     N: generic_array::ArrayLength<T>,
@@ -63,7 +59,7 @@ where
     }
 }
 
-impl<T, N> SpmcQueue<T, N>
+impl<T, N> SpmsRing<T, N>
 where
     T: core::default::Default + Copy,
     N: generic_array::ArrayLength<T>,
@@ -77,7 +73,6 @@ where
             read_idx: AtomicUsize::new(0),
             write_idx: AtomicUsize::new(gen),
             filled: AtomicBool::new(false),
-            mut_lock: AtomicBool::new(false),
         };
         inst.buf_len = inst.buf.len();
         if gen > inst.buf_len {
@@ -120,7 +115,7 @@ where
     /// - Read from the token index + 1
     /// - Read from oldest index
     /// - nb::Error::WouldBlock
-    fn read_after_full(&mut self, token: &mut ReadToken) -> nb::Result<T, ()> {
+    fn read_after_full(&self, token: &mut ReadToken) -> nb::Result<T, ()> {
         let desired = token.idx.wrapping_add(1);
         let widx = self.write_idx.load(Ordering::SeqCst);
         if desired == widx {
@@ -162,7 +157,7 @@ where
     }
 
     /// this assumes that the indices haven't wrapped yet
-    fn read_before_full(&mut self, token: &mut ReadToken) -> nb::Result<T, ()> {
+    fn read_before_full(&self, token: &mut ReadToken) -> nb::Result<T, ()> {
         //oldest_idx should be zero if we aren't full yet
         let oldest_idx = 0; //self.read_idx.load(Ordering::SeqCst);
 
@@ -186,7 +181,7 @@ where
 
     /// Read an item from the queue
     /// Returns either an available msg or WouldBlock
-    pub fn read_next(&mut self, token: &mut ReadToken) -> nb::Result<T, ()> {
+    pub fn read_next(&self, token: &mut ReadToken) -> nb::Result<T, ()> {
         if self.filled.load(Ordering::SeqCst) {
             self.read_after_full(token)
         } else {
@@ -201,7 +196,7 @@ where
 
     /// How many total items are available to read?
     pub fn available(&self) -> usize {
-        if !self.filled.load(Relaxed) {
+        if !self.filled.load(Ordering::Relaxed) {
             self.write_idx
                 .load(Ordering::SeqCst)
                 .wrapping_sub(self.read_idx.load(Ordering::SeqCst))
@@ -209,33 +204,17 @@ where
             self.buf_len
         }
     }
-
-    // pub fn item_at(&self, n: usize) -> T {
-    //     self.buf[n]
-    // }
-
-    fn lock_me(&mut self) {
-        while self
-            .mut_lock
-            .compare_and_swap(false, true, Ordering::Acquire)
-            != false
-        {
-            while self.mut_lock.load(Ordering::Relaxed) {
-                core::sync::atomic::spin_loop_hint();
-            }
-        }
-    }
-
-    fn unlock_me(&mut self) {
-        self.mut_lock
-            .compare_and_swap(true, false, Ordering::Acquire);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::AtomicPtr;
+    use core::time;
     use generic_array::typenum::U10;
+    use lazy_static::lazy_static;
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::thread;
 
     #[derive(Default, Debug, Copy, Clone)]
     struct Simple {
@@ -251,7 +230,7 @@ mod tests {
     #[test]
     fn alternating_write_read() {
         const WRITE_COUNT: u32 = 5;
-        let mut q = SpmcQueue::<Simple, U10>::default();
+        let mut q = SpmsRing::<Simple, U10>::default();
         let mut read_token = ReadToken::default();
 
         for i in 0..WRITE_COUNT {
@@ -270,7 +249,7 @@ mod tests {
     #[test]
     fn sequential_write_read() {
         const WRITE_COUNT: u32 = 5;
-        let mut q = SpmcQueue::<Simple, U10>::default();
+        let mut q = SpmsRing::<Simple, U10>::default();
         let mut read_token = ReadToken::default();
 
         for i in 0..WRITE_COUNT {
@@ -295,7 +274,7 @@ mod tests {
         // Write many more items than the buffer can hold
         const BUF_SIZE: u32 = 10;
         const ITEM_COUNT: u32 = BUF_SIZE * 2;
-        let mut q = SpmcQueue::<Simple, U10>::default();
+        let mut q = SpmsRing::<Simple, U10>::default();
 
         //publish more items than the buffer has space to hold
         for i in 0..ITEM_COUNT {
@@ -327,7 +306,7 @@ mod tests {
 
         // we initialize a queue with many generations already supposedly published:
         // this allows us to test generation overflow in a reasonable time
-        let mut q: SpmcQueue<Simple, U10> = SpmcQueue::new_with_generation(FIRST_GENERATION);
+        let mut q: SpmsRing<Simple, U10> = SpmsRing::new_with_generation(FIRST_GENERATION);
 
         // now publish many more items, so that generation counter (write index) overflows
         for i in 0..ITEM_PUBLISH_COUNT {
@@ -341,5 +320,83 @@ mod tests {
             q.publish(&s);
         }
         assert_eq!(q.available() as u32, BUF_SIZE);
+    }
+
+    #[test]
+    fn multithreaded_writer_readers() {
+        const BUF_SIZE: u32 = 10;
+        const ITEM_PUBLISH_COUNT: u32 = 3 * BUF_SIZE;
+        lazy_static! {
+            /// this is how we share a ring between multiple threads
+            static ref Q_PTR: AtomicPtr<SpmsRing::<Simple, U10>> = AtomicPtr::default();
+        };
+        let mut shared_q = SpmsRing::<Simple, U10>::default();
+        Q_PTR.store(&mut shared_q, Ordering::Relaxed);
+
+        //used to report back how many items each subscriber read
+        let (tx, rx): (Sender<u32>, Receiver<u32>) = mpsc::channel();
+
+        let mut children = Vec::new();
+        const NUM_SUBSCRIBERS: u32 = 128;
+        for _ in 0..NUM_SUBSCRIBERS {
+            //let inner_q = arc_q.clone();
+            let thread_tx = tx.clone();
+
+            let child = thread::spawn(move || {
+                let mut read_tok = ReadToken::default();
+                let mut read_count = 0;
+                while read_count < BUF_SIZE {
+                    // safe because Q_PTR never changes and
+                    // we are accessing this lock-free data structure as read-only
+                    let msg = unsafe {
+                        Q_PTR
+                            .load(Ordering::Relaxed)
+                            .as_ref()
+                            .unwrap()
+                            .read_next(&mut read_tok)
+                    };
+                    match msg {
+                        Ok(_) => read_count += 1,
+                        Err(nb::Error::WouldBlock) => {}
+                        _ => break,
+                    }
+                }
+
+                //report how many items we (eventually) read
+                thread_tx
+                    .send(read_count)
+                    .expect("couldn't send read_count");
+            });
+            children.push(child);
+        }
+
+        //allow the read threads to start maybe
+        thread::sleep(time::Duration::from_millis(1));
+
+        //start the writer thread
+        let writer_thread = thread::spawn(move || {
+            for i in 0..ITEM_PUBLISH_COUNT {
+                let s = Simple::new(i, i);
+                //safe because only this thread ever uses a mutable SpmsRing,
+                //and Q_PTR never changes
+                unsafe { Q_PTR.load(Ordering::SeqCst).as_mut().unwrap().publish(&s) }
+            }
+            let avail =
+                unsafe { Q_PTR.load(Ordering::SeqCst).as_ref().unwrap().available() as u32 };
+            assert_eq!(avail, BUF_SIZE);
+        });
+
+        //wait for the writer thread to finish writing
+        writer_thread.join().expect("writer thread panicked");
+
+        // find out how many items the subscribers actually read
+        for _ in 0..NUM_SUBSCRIBERS {
+            let num_read = rx.recv().expect("couldn't receive num_read");
+            assert_eq!(num_read, BUF_SIZE);
+        }
+
+        for child in children {
+            child.join().expect("child panicked");
+        }
     }
 }
