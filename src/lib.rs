@@ -2,6 +2,7 @@
 Copyright (c) 2020 Todd Stellanova
 LICENSE: BSD3 (see LICENSE file)
 */
+#![cfg_attr(not(test), no_std)]
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use generic_array::{ArrayLength, GenericArray};
@@ -139,10 +140,8 @@ where
                 let gap = widx.wrapping_sub(desired);
                 if gap >= self.buf_len {
                     // assume that the caller hasn't read in a long time
-                    println!("wrapped, assume stale");
                     oldest_idx
                 } else {
-                    println!("wrapped");
                     desired.wrapping_add(1)
                 }
             }
