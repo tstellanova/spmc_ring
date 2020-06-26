@@ -157,19 +157,20 @@ where
 
     /// this assumes that the indices haven't wrapped yet
     fn read_before_full(&self, token: &mut ReadToken) -> nb::Result<T, ()> {
-        //oldest_idx should be zero if we aren't full yet
-        let oldest_idx = 0; //self.read_idx.load(Ordering::SeqCst);
-        let widx = self.write_idx.load(Ordering::SeqCst);
 
-        let ridx = if !token.initialized {
-            oldest_idx
-        } else {
-            let desired = token.idx.wrapping_add(1);
-            desired
-        };
-        if ridx >= widx {
+        let ridx =
+            if !token.initialized {
+                //oldest_idx should be zero if we aren't full yet
+                0
+            } else {
+               token.idx + 1
+            };
+
+        let widx = self.write_idx.load(Ordering::SeqCst);
+        if !(ridx < widx) {
             return Err(nb::Error::WouldBlock);
         }
+
         token.initialized = true;
         token.idx = ridx;
 
@@ -192,9 +193,14 @@ where
         self.write_idx.load(Ordering::SeqCst) == self.read_idx.load(Ordering::SeqCst)
     }
 
+    /// Is this buffer filled to capacity?
+    pub fn at_capacity(&self) -> bool {
+        self.filled.load(Ordering::SeqCst)
+    }
+
     /// How many total items are available to read?
     pub fn available(&self) -> usize {
-        if !self.filled.load(Ordering::Relaxed) {
+        if !self.filled.load(Ordering::SeqCst) {
             self.write_idx
                 .load(Ordering::SeqCst)
                 .wrapping_sub(self.read_idx.load(Ordering::SeqCst))
@@ -209,7 +215,7 @@ mod tests {
     use super::*;
     use core::sync::atomic::AtomicPtr;
     use core::time;
-    use generic_array::typenum::U10;
+    use generic_array::typenum::{U10,U24};
     use lazy_static::lazy_static;
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::thread;
@@ -323,7 +329,7 @@ mod tests {
     #[test]
     fn generation_overflow_write_read() {
         const BUF_SIZE: u32 = 10;
-        const ITEM_PUBLISH_COUNT: u32 = 5 * BUF_SIZE;
+        const ITEM_PUBLISH_COUNT: u32 = 100 * BUF_SIZE;
         const FIRST_GENERATION: usize = usize::MAX - 20;
 
         // we initialize a queue with many generations already supposedly published:
@@ -346,13 +352,13 @@ mod tests {
 
     #[test]
     fn multithreaded_writer_readers() {
-        const BUF_SIZE: u32 = 10;
+        const BUF_SIZE: u32 = 24;
         const ITEM_PUBLISH_COUNT: u32 = 3 * BUF_SIZE;
         lazy_static! {
             /// this is how we share a ring between multiple threads
-            static ref Q_PTR: AtomicPtr<SpmsRing::<Simple, U10>> = AtomicPtr::default();
+            static ref Q_PTR: AtomicPtr<SpmsRing::<Simple, U24>> = AtomicPtr::default();
         };
-        let mut shared_q = SpmsRing::<Simple, U10>::default();
+        let mut shared_q = SpmsRing::<Simple, U24>::default();
         Q_PTR.store(&mut shared_q, Ordering::Relaxed);
 
         //used to report back how many items each subscriber read
@@ -367,18 +373,43 @@ mod tests {
             let child = thread::spawn(move || {
                 let mut read_tok = ReadToken::default();
                 let mut read_count = 0;
+                let mut prev_read_val = 0;
+                let mut read_chain = vec![];
+
                 while read_count < BUF_SIZE {
+                    let read_attempt = read_tok.idx;
                     // safe because Q_PTR never changes and
                     // we are accessing this lock-free data structure as read-only
-                    let msg = unsafe {
+                    let msg_r = unsafe {
                         Q_PTR
                             .load(Ordering::Relaxed)
                             .as_ref()
                             .unwrap()
                             .read_next(&mut read_tok)
                     };
-                    match msg {
-                        Ok(_) => read_count += 1,
+                    match msg_r {
+                        Ok(msg) => {
+                            read_count += 1;
+                            //ensure that we read in order
+                            let cur_val = msg.x;
+                            read_chain.push((read_attempt, read_tok.idx, cur_val));
+
+                            if cur_val < prev_read_val {
+                                let qbuf = unsafe {
+                                    Q_PTR.load(Ordering::Relaxed)
+                                        .as_ref()
+                                        .unwrap()
+                                };
+
+                                let avail = qbuf.available();
+                                println!("chain: {:?}", read_chain);
+                                println!("cur {} prev {} avail: {} read_attempt: {} cap: {} ",
+                                         cur_val, avail, prev_read_val, read_attempt, qbuf.at_capacity());
+
+                            }
+                            assert!(cur_val >= prev_read_val);
+                            prev_read_val = cur_val;
+                        },
                         Err(nb::Error::WouldBlock) => {}
                         _ => break,
                     }
