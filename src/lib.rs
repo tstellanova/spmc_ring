@@ -2,19 +2,21 @@
 Copyright (c) 2020 Todd Stellanova
 LICENSE: BSD3 (see LICENSE file)
 */
-// #![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_std)]
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use generic_array::{ArrayLength, GenericArray};
 
-/// This is a ring-buffer queue that is intended to be
+/// This is a ring buffer that is intended to be
 /// used for pub-sub applications.  That is, a single
-/// producer writes items to the circular queue, and
-/// multiple consumers can read items from the queue.
+/// producer writes items to the circular buffer, and
+/// multiple subscribers can read items from the buffer.
 /// When a write to the fixed-size circular buffer overflows,
-/// the oldest items in the queue are overwritten.
-/// It is up to the readers to keep track of which items they
-/// have already read and poll for the next available item.
+/// the oldest items in the buffer are overwritten.
+/// Subscribers use ReadTokens to track which items they have
+/// already read, and use nonblocking poll to read the next available item.
+///
+/// Note that the fixed buffer length must always be a power of two.
 pub struct SpmsRing<T, N: ArrayLength<T>> {
     /// The inner item buffer
     buf: GenericArray<T, N>,
@@ -53,8 +55,9 @@ impl Default for ReadToken {
 impl<T, N> Default for SpmsRing<T, N>
 where
     T: core::default::Default + Copy + core::fmt::Debug,
-    N: generic_array::ArrayLength<T>,
+    N: ArrayLength<T>,
 {
+    /// This is how the buffer should be created
     fn default() -> Self {
         Self::new_with_generation(0)
     }
@@ -63,7 +66,7 @@ where
 impl<T, N> SpmsRing<T, N>
 where
     T: core::default::Default + Copy + core::fmt::Debug,
-    N: generic_array::ArrayLength<T>,
+    N: ArrayLength<T>,
 {
     /// Create a queue prepopulated with some
     /// number of default-value items.
@@ -78,7 +81,7 @@ where
         //TODO obtain buf_len in some const way
         inst.buf_len = inst.buf.len();
         assert!(inst.buf_len % 2 == 0, "buffer capacity must be a power of two");
-        println!("buf_len: {}", inst.buf_len);
+        // println!("buf_len: {}", inst.buf_len);
         if gen > inst.buf_len {
             inst.filled.store(true, Ordering::SeqCst);
             inst.read_idx.store(
@@ -110,7 +113,7 @@ where
         if self.filled.load(Ordering::SeqCst) {
             let new_ridx = widx.wrapping_sub(self.buf_len - 1);
             self.read_idx.store(new_ridx, Ordering::SeqCst);
-            println!("pub {}->{} = {:?}", widx, clamped_widx, self.buf[clamped_widx]);
+            // println!("pub {}->{} = {:?}", widx, clamped_widx, self.buf[clamped_widx]);
         } else if clamped_widx == (self.buf_len - 1) {
             self.filled.store(true, Ordering::SeqCst);
         }
@@ -119,11 +122,13 @@ where
         //automatically overwritten when we push to a full buffer
     }
 
-    /// Used to serve reads when the buffer is already full
-     /// In practice there are only three results:
-     /// - Read from the token index + 1
-     /// - Read from oldest index
-     /// - nb::Error::WouldBlock
+
+    /// Read an item from the buffer.
+    /// Returns either an available item or WouldBlock
+    /// There are only three possible actions:
+    /// - Read from the next available index after index in read token
+    /// - Read from oldest index (the read token might be stale)
+    /// - `nb::Error::WouldBlock`
     fn read_forgiving(&self, token: &mut ReadToken) -> nb::Result<T, ()> {
         let oldest = self.read_idx.load(Ordering::SeqCst);
         let desired =
@@ -138,22 +143,27 @@ where
             return Err(nb::Error::WouldBlock);
         }
 
+        let wgap =
+            if next_write > desired { next_write - desired }
+            else { next_write.wrapping_sub(desired) };
+
         let ridx =
-            if next_write > desired {
-                if desired > oldest { desired }
-                else { oldest }
-            }
-            else {
-                //widx may have wrapped
-                let wgap = next_write.wrapping_sub(desired);
-                println!("oldest {} desired {} nextw {} wgap {}", oldest, desired, next_write, wgap);
-                if wgap > self.buf_len {
-                    oldest
-                }
-                else {
-                    desired
-                }
-            };
+            if wgap < self.buf_len { desired }
+            else { oldest };
+
+            // if next_write > desired {
+            //     // println!("oldest {} desired {} nextw {}",oldest, desired, next_write);
+            //     // desired may have wrapped before oldest
+            //     if (next_write - desired) < self.buf_len  { desired }
+            //     else { oldest }
+            // }
+            // else {
+            //     //widx may have wrapped
+            //     let wgap = next_write.wrapping_sub(desired);
+            //     // println!("oldest {} desired {} nextw {} wgap {}", oldest, desired, next_write, wgap);
+            //     if wgap < self.buf_len { desired }
+            //     else { oldest }
+            // };
 
 
         token.initialized = true;
@@ -165,12 +175,6 @@ where
     }
 
 
-    /// Read an item from the ring buffer.
-    /// Returns either an available item or WouldBlock
-    /// There are only three possible actions:
-    /// - Read from the next available index after index in read token
-    /// - Read from oldest index (the read token might be stale)
-    /// - `nb::Error::WouldBlock`
     pub fn read_next(&self, token: &mut ReadToken) -> nb::Result<T, ()> {
         self.read_forgiving(token)
     }
@@ -272,7 +276,6 @@ mod tests {
         for i in 0..WRITE_COUNT {
             let s = Simple::new(i, i);
             q.publish(&s);
-            // println!("item {}: in {:?} out {:?}", i, s, q.item_at(i as usize));
         }
         assert_eq!(q.available() as u32, WRITE_COUNT);
 
@@ -320,8 +323,7 @@ mod tests {
         const BUF_SIZE: u32 = 8;
         const ITEM_PUBLISH_COUNT: u32 =  BUF_SIZE;
         const FIRST_GENERATION: usize = usize::MAX - (ITEM_PUBLISH_COUNT/2) as usize;
-
-        println!("maxusize: {} first_gen: {}", usize::MAX, FIRST_GENERATION);
+        // println!("maxusize: {} first_gen: {}", usize::MAX, FIRST_GENERATION);
 
         // we initialize a queue with many generations already supposedly published:
         // this allows us to test generation overflow in a reasonable time
@@ -340,7 +342,7 @@ mod tests {
             let cur_msg = q.read_next(&mut read_token).unwrap();
             //verify values ascending
             let cur_val = cur_msg.x;
-            println!("{} cur {} pre {}", read_count, cur_val, pre_val);
+            // println!("{} cur {} pre {}", read_count, cur_val, pre_val);
 
             if 0 != pre_val {
                 assert_eq!(cur_val.wrapping_sub(pre_val), 1);
