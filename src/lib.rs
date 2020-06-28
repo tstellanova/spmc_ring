@@ -80,7 +80,10 @@ where
         };
         //TODO obtain buf_len in some const way
         inst.buf_len = inst.buf.len();
-        assert!(inst.buf_len % 2 == 0, "buffer capacity must be a power of two");
+        assert!(
+            inst.buf_len % 2 == 0,
+            "buffer capacity must be a power of two"
+        );
         // println!("buf_len: {}", inst.buf_len);
         if gen > inst.buf_len {
             inst.filled.store(true, Ordering::SeqCst);
@@ -113,7 +116,7 @@ where
         if self.filled.load(Ordering::SeqCst) {
             let new_ridx = widx.wrapping_sub(self.buf_len - 1);
             self.read_idx.store(new_ridx, Ordering::SeqCst);
-            // println!("pub {}->{} = {:?}", widx, clamped_widx, self.buf[clamped_widx]);
+        // println!("pub {}->{} = {:?}", widx, clamped_widx, self.buf[clamped_widx]);
         } else if clamped_widx == (self.buf_len - 1) {
             self.filled.store(true, Ordering::SeqCst);
         }
@@ -121,7 +124,6 @@ where
         //thanks to wrapping behavior on write_idx, oldest value is
         //automatically overwritten when we push to a full buffer
     }
-
 
     /// Read an item from the buffer.
     /// Returns either an available item or WouldBlock
@@ -131,12 +133,11 @@ where
     /// - `nb::Error::WouldBlock`
     pub fn read_next(&self, token: &mut ReadToken) -> nb::Result<T, ()> {
         let oldest = self.read_idx.load(Ordering::SeqCst);
-        let desired =
-            if !token.initialized {
-                oldest
-            } else {
-                token.idx.wrapping_add(1)
-            };
+        let desired = if !token.initialized {
+            oldest
+        } else {
+            token.idx.wrapping_add(1)
+        };
 
         let next_write = self.write_idx.load(Ordering::SeqCst);
         if desired == next_write {
@@ -144,12 +145,7 @@ where
         }
 
         let wgap = next_write.wrapping_sub(desired);
-            // if next_write > desired { next_write - desired }
-            // else { next_write.wrapping_sub(desired) };
-
-        let ridx =
-            if wgap < self.buf_len { desired }
-            else { oldest };
+        let ridx = if wgap < self.buf_len { desired } else { oldest };
 
         token.initialized = true;
         token.idx = ridx;
@@ -174,7 +170,7 @@ where
     /// How many total items are available to read?
     pub fn available(&self) -> usize {
         if !self.filled.load(Ordering::SeqCst) {
-            let widx =  self.write_idx.load(Ordering::SeqCst);
+            let widx = self.write_idx.load(Ordering::SeqCst);
             let ridx = self.read_idx.load(Ordering::SeqCst);
             let avail = widx.wrapping_sub(ridx);
             assert!(avail <= self.buf_len);
@@ -190,7 +186,7 @@ mod tests {
     use super::*;
     use core::sync::atomic::AtomicPtr;
     use core::time;
-    use generic_array::typenum::{U8,U24};
+    use generic_array::typenum::{U24, U8};
     use lazy_static::lazy_static;
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::thread;
@@ -216,7 +212,7 @@ mod tests {
         let mut read_res = q.read_next(&mut read_token);
         //should be no data available yet
         assert!(read_res.is_err());
-        assert_eq!( read_res.err().unwrap(), nb::Error::WouldBlock);
+        assert_eq!(read_res.err().unwrap(), nb::Error::WouldBlock);
 
         for i in 0..WRITE_COUNT {
             let s = Simple::new(i, i);
@@ -226,7 +222,7 @@ mod tests {
             read_res = q.read_next(&mut read_token);
             assert!(read_res.is_ok());
             read_res = q.read_next(&mut read_token);
-            assert_eq!( read_res.err().unwrap(), nb::Error::WouldBlock);
+            assert_eq!(read_res.err().unwrap(), nb::Error::WouldBlock);
         }
     }
 
@@ -303,8 +299,8 @@ mod tests {
     #[test]
     fn generation_overflow_write_read() {
         const BUF_SIZE: u32 = 8;
-        const ITEM_PUBLISH_COUNT: u32 =  BUF_SIZE;
-        const FIRST_GENERATION: usize = usize::MAX - (ITEM_PUBLISH_COUNT/2) as usize;
+        const ITEM_PUBLISH_COUNT: u32 = BUF_SIZE;
+        const FIRST_GENERATION: usize = usize::MAX - (ITEM_PUBLISH_COUNT / 2) as usize;
         // println!("maxusize: {} first_gen: {}", usize::MAX, FIRST_GENERATION);
 
         // we initialize a queue with many generations already supposedly published:
@@ -360,56 +356,51 @@ mod tests {
             let thread_tx = tx.clone();
 
             let child = thread::Builder::new()
-                .name(format!("sid{}",subscriber_id).to_string())
+                .name(format!("sid{}", subscriber_id).to_string())
                 .spawn(move || {
-                let mut read_tok = unsafe {
-                    Q_PTR
-                        .load(Ordering::SeqCst)
-                        .as_ref()
-                        .unwrap()
-                        .subscribe()
-                };
-                let mut read_count = 0;
-                let mut prev_val = 0;
-                let mut read_chain = vec![];
-                let my_sub_id: u32 = subscriber_id;
-                while read_count < BUF_SIZE {
-                    // safe because Q_PTR never changes and
-                    // we are accessing this lock-free data structure as read-only
-                    let msg_r = unsafe {
-                        Q_PTR
-                            .load(Ordering::SeqCst)
-                            .as_ref()
-                            .unwrap()
-                            .read_next(&mut read_tok)
-                    };
-                    match msg_r {
-                        Ok(msg) => {
-                            read_count += 1;
-                            //ensure that we read in order
-                            let cur_val = msg.x;
-                            read_chain.push((read_tok.idx, cur_val));
+                    let mut read_tok =
+                        unsafe { Q_PTR.load(Ordering::SeqCst).as_ref().unwrap().subscribe() };
+                    let mut read_count = 0;
+                    let mut prev_val = 0;
+                    let mut read_chain = vec![];
+                    let my_sub_id: u32 = subscriber_id;
+                    while read_count < BUF_SIZE {
+                        // safe because Q_PTR never changes and
+                        // we are accessing this lock-free data structure as read-only
+                        let msg_r = unsafe {
+                            Q_PTR
+                                .load(Ordering::SeqCst)
+                                .as_ref()
+                                .unwrap()
+                                .read_next(&mut read_tok)
+                        };
+                        match msg_r {
+                            Ok(msg) => {
+                                read_count += 1;
+                                //ensure that we read in order
+                                let cur_val = msg.x;
+                                read_chain.push((read_tok.idx, cur_val));
 
-                            if cur_val < prev_val {
-                                //TODO the ridx is being returned as the value when it should block
-                                println!("sid {}: {:?}", my_sub_id, read_chain);
-                                break;
+                                if cur_val < prev_val {
+                                    //TODO the ridx is being returned as the value when it should block
+                                    println!("sid {}: {:?}", my_sub_id, read_chain);
+                                    break;
+                                }
+
+                                prev_val = cur_val;
                             }
-
-                            prev_val = cur_val;
-                        },
-                        Err(nb::Error::WouldBlock) => {}
-                        _ => break,
+                            Err(nb::Error::WouldBlock) => {}
+                            _ => break,
+                        }
                     }
-                }
 
-                //report how many items we (eventually) read
-                let send_res = thread_tx.send(read_count);
-                if send_res.is_err() {
-                    println!("couldn't report: {:?}", send_res)
-                }
-
-            }).expect("couldn't spawn child");
+                    //report how many items we (eventually) read
+                    let send_res = thread_tx.send(read_count);
+                    if send_res.is_err() {
+                        println!("couldn't report: {:?}", send_res)
+                    }
+                })
+                .expect("couldn't spawn child");
             children.push(child);
         }
 
@@ -425,8 +416,7 @@ mod tests {
                 unsafe { Q_PTR.load(Ordering::SeqCst).as_mut().unwrap().publish(&s) }
             }
 
-            let filled =
-                unsafe { Q_PTR.load(Ordering::SeqCst).as_ref().unwrap().at_capacity() };
+            let filled = unsafe { Q_PTR.load(Ordering::SeqCst).as_ref().unwrap().at_capacity() };
             assert!(filled);
         });
 
