@@ -7,14 +7,15 @@ LICENSE: BSD3 (see LICENSE file)
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use generic_array::{ArrayLength, GenericArray};
 
-/// This is a ring buffer that is intended to be
-/// used for pub-sub applications.  That is, a single
-/// producer writes items to the circular buffer, and
+/// This is a ring buffer intended for use in pub-sub applications.
+/// That is, a single publisher writes items to the  buffer, and
 /// multiple subscribers can read items from the buffer.
 /// When a write to the fixed-size circular buffer overflows,
 /// the oldest items in the buffer are overwritten.
+/// Reading items from the buffer does not remove them from the buffer
+/// (as it would from a Queue): instead,
 /// Subscribers use ReadTokens to track which items they have
-/// already read, and use nonblocking poll to read the next available item.
+/// already read, and use nonblocking read to read the next available item.
 ///
 /// Note that the fixed buffer length must always be a power of two.
 pub struct SpmsRing<T, N: ArrayLength<T>> {
@@ -68,8 +69,7 @@ where
     T: core::default::Default + Copy + core::fmt::Debug,
     N: ArrayLength<T>,
 {
-    /// Create a queue prepopulated with some
-    /// number of default-value items.
+    /// Create a queue prepopulated with some number of default-value items.
     fn new_with_generation(gen: usize) -> Self {
         let mut inst = Self {
             buf: GenericArray::default(),
@@ -129,7 +129,7 @@ where
     /// - Read from the next available index after index in read token
     /// - Read from oldest index (the read token might be stale)
     /// - `nb::Error::WouldBlock`
-    fn read_forgiving(&self, token: &mut ReadToken) -> nb::Result<T, ()> {
+    pub fn read_next(&self, token: &mut ReadToken) -> nb::Result<T, ()> {
         let oldest = self.read_idx.load(Ordering::SeqCst);
         let desired =
             if !token.initialized {
@@ -143,28 +143,13 @@ where
             return Err(nb::Error::WouldBlock);
         }
 
-        let wgap =
-            if next_write > desired { next_write - desired }
-            else { next_write.wrapping_sub(desired) };
+        let wgap = next_write.wrapping_sub(desired);
+            // if next_write > desired { next_write - desired }
+            // else { next_write.wrapping_sub(desired) };
 
         let ridx =
             if wgap < self.buf_len { desired }
             else { oldest };
-
-            // if next_write > desired {
-            //     // println!("oldest {} desired {} nextw {}",oldest, desired, next_write);
-            //     // desired may have wrapped before oldest
-            //     if (next_write - desired) < self.buf_len  { desired }
-            //     else { oldest }
-            // }
-            // else {
-            //     //widx may have wrapped
-            //     let wgap = next_write.wrapping_sub(desired);
-            //     // println!("oldest {} desired {} nextw {} wgap {}", oldest, desired, next_write, wgap);
-            //     if wgap < self.buf_len { desired }
-            //     else { oldest }
-            // };
-
 
         token.initialized = true;
         token.idx = ridx;
@@ -174,17 +159,14 @@ where
         Ok(val)
     }
 
-
-    pub fn read_next(&self, token: &mut ReadToken) -> nb::Result<T, ()> {
-        self.read_forgiving(token)
-    }
-
     /// Is the queue empty?
     pub fn empty(&self) -> bool {
         self.write_idx.load(Ordering::SeqCst) == self.read_idx.load(Ordering::SeqCst)
     }
 
     /// Is this buffer filled to capacity?
+    /// In other words, will a subsequent publish overwrite the
+    /// oldest item in the buffer?
     pub fn at_capacity(&self) -> bool {
         self.filled.load(Ordering::SeqCst)
     }
@@ -338,11 +320,11 @@ mod tests {
 
         let mut read_token = q.subscribe();
         let mut pre_val = 0;
-        for read_count in 0..BUF_SIZE {
+        for _read_count in 0..BUF_SIZE {
             let cur_msg = q.read_next(&mut read_token).unwrap();
             //verify values ascending
             let cur_val = cur_msg.x;
-            // println!("{} cur {} pre {}", read_count, cur_val, pre_val);
+            // println!("{} cur {} pre {}", _read_count, cur_val, pre_val);
 
             if 0 != pre_val {
                 assert_eq!(cur_val.wrapping_sub(pre_val), 1);
